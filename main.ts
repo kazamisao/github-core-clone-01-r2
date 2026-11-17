@@ -18,6 +18,12 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node
 // built-in, no model call.
+//
+// Round 2 note: this lifecycle is unchanged from round 1. The speed lives in
+// the server behind createApp — gitproto.ts caches fetch, ls-refs and
+// advertisement bodies (git objects are immutable, so the cached bytes stay
+// correct), and store.ts/rest.ts serve a single-issue GET from a cached
+// serialization that patchIssue invalidates.
 
 import { createApp } from './app.ts';
 
