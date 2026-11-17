@@ -11,6 +11,8 @@ import { handleMcp } from './mcp.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+/** The single-issue GET route shape, matched on the raw (still encoded) path. */
+const ISSUE_GET_PATH = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
 
 let requestCounter = 0;
 
@@ -63,14 +65,35 @@ export function createApp(): Server {
     void (async () => {
       const requestId = `req-${++requestCounter}`;
       try {
-        const url = new URL(request.url ?? '/', `http://${request.headers.host ?? '127.0.0.1'}`);
-        const pathname = url.pathname;
         const method = request.method ?? 'GET';
+        const rawUrl = request.url ?? '/';
+        const queryAt = rawUrl.indexOf('?');
+        const rawPath = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
 
         // Boot probe — no token, plain 200.
-        if (pathname === '/healthz' && method === 'GET') {
+        if (rawPath === '/healthz' && method === 'GET') {
           return sendJson(response, requestId, 200, { status: 'ok' });
         }
+
+        // Read hot path: a single-issue GET whose serialized body is already
+        // cached on the issue is served without URL parsing or the general
+        // router. The route regex only matches the canonical path shape, the
+        // auth gate runs first exactly as in the general path, and a cold
+        // cache falls through to handleRest, which builds and caches the body
+        // (patchIssue clears it, so a cached body is never stale).
+        if (method === 'GET') {
+          const issueMatch = ISSUE_GET_PATH.exec(rawPath);
+          if (issueMatch) {
+            if (!authorized(request)) return sendJson(response, requestId, 401, { message: 'Requires authentication' });
+            const repo = store.getRepo(issueMatch[1] as string, issueMatch[2] as string);
+            const issue = repo ? store.getIssue(repo, Number(issueMatch[3])) : undefined;
+            if (!issue) return sendJson(response, requestId, 404, { message: 'Not Found' });
+            if (issue.jsonCache !== undefined) return sendJson(response, requestId, 200, null, {}, issue.jsonCache);
+          }
+        }
+
+        const url = new URL(rawUrl, `http://${request.headers.host ?? '127.0.0.1'}`);
+        const pathname = url.pathname;
 
         // GraphQL — POST /api/graphql
         if (pathname === '/api/graphql') {
