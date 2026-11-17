@@ -34,6 +34,8 @@ export interface Issue {
   labels: string[];
   readonly createdSeq: number;
   updatedSeq: number;
+  /** Serialized REST shape of this issue, cached by rest.ts; cleared on patch. */
+  jsonCache?: string;
 }
 
 export interface Pull {
@@ -72,6 +74,10 @@ export interface Repo {
   readonly objects: Map<string, GitObject>;
   readonly refs: Map<string, string>;
   readonly issues: Issue[];
+  /** Number → issue index so a single-issue read is O(1), not a scan. */
+  readonly issuesByNumber: Map<number, Issue>;
+  /** gitproto response cache (advertisements, ls-refs, fetch bodies). */
+  readonly protoCache: Map<string, Buffer>;
   readonly pulls: Pull[];
   readonly labels: Map<string, Label>;
   readonly comments: Map<number, Comment[]>;
@@ -82,8 +88,15 @@ export function repoKey(owner: string, name: string): string {
   return `${owner}/${name}`;
 }
 
+const isoOfCache = new Map<number, string>();
+
 function isoOf(seq: number): string {
-  return new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  const cached = isoOfCache.get(seq);
+  if (cached !== undefined) return cached;
+  const rendered = new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  if (isoOfCache.size > 4096) isoOfCache.clear();
+  isoOfCache.set(seq, rendered);
+  return rendered;
 }
 
 export class Store {
@@ -114,6 +127,8 @@ export class Store {
       objects: new Map(),
       refs: new Map(),
       issues: [],
+      issuesByNumber: new Map(),
+      protoCache: new Map(),
       pulls: [],
       labels: new Map(),
       comments: new Map(),
@@ -376,11 +391,12 @@ export class Store {
       updatedSeq: seq,
     };
     repo.issues.push(issue);
+    repo.issuesByNumber.set(issue.number, issue);
     return { issue };
   }
 
   getIssue(repo: Repo, number: number): Issue | undefined {
-    return repo.issues.find((i) => i.number === number);
+    return repo.issuesByNumber.get(number);
   }
 
   patchIssue(repo: Repo, number: number, patch: { state?: 'open' | 'closed'; title?: string; body?: string }): Issue | undefined {
@@ -390,6 +406,7 @@ export class Store {
     if (patch.title !== undefined) issue.title = patch.title;
     if (patch.body !== undefined) issue.body = patch.body;
     issue.updatedSeq = this.tick();
+    issue.jsonCache = undefined;
     return issue;
   }
 

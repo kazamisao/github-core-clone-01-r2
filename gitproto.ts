@@ -159,6 +159,28 @@ function v2Advertisement(): Buffer {
   ]);
 }
 
+/** The v2 advertisement names no refs, so one buffer serves every request. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
+/**
+ * A content fingerprint of the repo's refs. Git objects are content-addressed
+ * and immutable once stored, and every ref-dependent response (advertisement,
+ * ls-refs) is a pure function of the refs plus the request, so this string is
+ * a sound cache key component for them.
+ */
+function refsFingerprint(repo: Repo): string {
+  let out = '';
+  for (const [ref, oid] of repo.refs) out += `${ref} ${oid}\n`;
+  return out;
+}
+
+const PROTO_CACHE_LIMIT = 512;
+
+function protoCachePut(repo: Repo, key: string, body: Buffer): void {
+  if (repo.protoCache.size >= PROTO_CACHE_LIMIT) repo.protoCache.clear();
+  repo.protoCache.set(key, body);
+}
+
 interface FetchPlan {
   /** Commits whose objects go into the pack. */
   readonly includedCommits: string[];
@@ -315,20 +337,24 @@ export class GitProto {
 
   infoRefs(repo: Repo, service: string, gitProtocol: string | undefined): GitResponse {
     if (service === 'git-upload-pack' && gitProtocol === 'version=2') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v2Advertisement() };
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
     }
     if (service === 'git-upload-pack' || service === 'git-receive-pack') {
       const contentType =
         service === 'git-upload-pack'
           ? 'application/x-git-upload-pack-advertisement'
           : 'application/x-git-receive-pack-advertisement';
-      return { status: 200, contentType, body: v0Advertisement(repo, service) };
+      const key = `adv0|${service}|${refsFingerprint(repo)}`;
+      const cached = repo.protoCache.get(key);
+      if (cached !== undefined) return { status: 200, contentType, body: cached };
+      const body = v0Advertisement(repo, service);
+      protoCachePut(repo, key, body);
+      return { status: 200, contentType, body };
     }
     return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'unknown service' }), 'utf8') };
   }
 
-  lsRefsV2(repo: Repo, body: Buffer): GitResponse {
-    const { packets } = decodePktLines(body);
+  lsRefsV2(repo: Repo, packets: readonly Pkt[]): GitResponse {
     let peel = false;
     let symrefs = false;
     let unborn = false;
@@ -347,6 +373,9 @@ export class GitProto {
       else if (trimmed === 'unborn') unborn = true;
       else if (trimmed.startsWith('ref-prefix ')) prefixes.push(trimmed.slice('ref-prefix '.length));
     }
+    const cacheKey = `lsr|${refsFingerprint(repo)}|${peel ? 1 : 0}${symrefs ? 1 : 0}${unborn ? 1 : 0}|${prefixes.join(',')}`;
+    const cached = repo.protoCache.get(cacheKey);
+    if (cached !== undefined) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
     const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
     const out: Buffer[] = [];
     const mainTip = repo.refs.get(MAIN);
@@ -364,11 +393,12 @@ export class GitProto {
       out.push(pktLine(`${ref.oid} ${ref.name}${peeled}\n`));
     }
     out.push(FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(out) };
+    const result = Buffer.concat(out);
+    protoCachePut(repo, cacheKey, result);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: result };
   }
 
-  fetchV2(repo: Repo, body: Buffer): GitResponse {
-    const { packets } = decodePktLines(body);
+  fetchV2(repo: Repo, packets: readonly Pkt[]): GitResponse {
     const wants: string[] = [];
     const haves: string[] = [];
     const shallow: string[] = [];
@@ -385,23 +415,47 @@ export class GitProto {
       else if (line.startsWith('shallow ')) shallow.push(line.slice(8).trim());
       else if (line.startsWith('deepen ')) depth = Number(line.slice(7).trim());
     }
-    const plan = planFetch(repo, wants, haves, shallow, depth);
-    const pack = buildFetchPack(repo, plan);
-    const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), FLUSH];
-    if (plan.shallow.length || plan.unshallow.length) {
-      parts.push(pktLine('shallow-info\n'));
-      for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-      for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-      parts.push(FLUSH);
-    }
-    parts.push(pktLine('packfile\n'));
-    parts.push(...sidebandPackets(1, pack));
-    parts.push(FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: this.fetchBody(repo, wants, haves, shallow, depth, true) };
   }
 
-  fetchV0(repo: Repo, body: Buffer): GitResponse {
-    const { packets } = decodePktLines(body);
+  /**
+   * The full fetch response for one negotiation. It is a pure function of the
+   * request and the object graph reachable from the named oids, and stored
+   * objects are immutable — so once every want/have/shallow names an object
+   * already in the store, the answer can be cached and replayed verbatim.
+   * When any named oid is missing, a later push could add it and change the
+   * answer, so those requests are never cached.
+   */
+  private fetchBody(repo: Repo, wants: readonly string[], haves: readonly string[], shallow: readonly string[], depth: number | undefined, v2: boolean): Buffer {
+    const allKnown = [...wants, ...haves, ...shallow].every((oid) => repo.objects.has(oid));
+    const key = allKnown ? `f${v2 ? 2 : 0}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth ?? ''}` : null;
+    if (key !== null) {
+      const cached = repo.protoCache.get(key);
+      if (cached !== undefined) return cached;
+    }
+    const plan = planFetch(repo, wants, haves, shallow, depth);
+    const pack = buildFetchPack(repo, plan);
+    const parts: Buffer[] = v2 ? [pktLine('acknowledgments\n'), pktLine('NAK\n'), FLUSH] : [pktLine('NAK\n')];
+    if (v2) {
+      if (plan.shallow.length || plan.unshallow.length) {
+        parts.push(pktLine('shallow-info\n'));
+        for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+        for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+        parts.push(FLUSH);
+      }
+      parts.push(pktLine('packfile\n'));
+    } else {
+      for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+      for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    }
+    parts.push(...sidebandPackets(1, pack));
+    parts.push(FLUSH);
+    const body = Buffer.concat(parts);
+    if (key !== null) protoCachePut(repo, key, body);
+    return body;
+  }
+
+  fetchV0(repo: Repo, packets: readonly Pkt[]): GitResponse {
     const wants: string[] = [];
     const haves: string[] = [];
     const shallow: string[] = [];
@@ -413,23 +467,16 @@ export class GitProto {
       else if (trimmed.startsWith('shallow ')) shallow.push(trimmed.slice(8).trim());
       else if (trimmed.startsWith('deepen ')) depth = Number(trimmed.slice(7).trim());
     }
-    const plan = planFetch(repo, wants, haves, shallow, depth);
-    const pack = buildFetchPack(repo, plan);
-    const parts: Buffer[] = [pktLine('NAK\n')];
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(...sidebandPackets(1, pack));
-    parts.push(FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: this.fetchBody(repo, wants, haves, shallow, depth, false) };
   }
 
   /** Dispatch a POST to git-upload-pack: v2 command or v0 want/have negotiation. */
   uploadPack(repo: Repo, body: Buffer, gitProtocol: string | undefined): GitResponse {
     const { packets } = decodePktLines(body);
     const first = packets.find((p) => p.kind === 'data' && p.payload)?.payload?.toString('utf8') ?? '';
-    if (gitProtocol === 'version=2' && first.startsWith('command=ls-refs')) return this.lsRefsV2(repo, body);
-    if (gitProtocol === 'version=2' && first.startsWith('command=fetch')) return this.fetchV2(repo, body);
-    return this.fetchV0(repo, body);
+    if (gitProtocol === 'version=2' && first.startsWith('command=ls-refs')) return this.lsRefsV2(repo, packets);
+    if (gitProtocol === 'version=2' && first.startsWith('command=fetch')) return this.fetchV2(repo, packets);
+    return this.fetchV0(repo, packets);
   }
 
   receivePack(repo: Repo, body: Buffer): GitResponse {

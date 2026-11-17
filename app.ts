@@ -32,8 +32,8 @@ function readBody(request: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function sendJson(response: ServerResponse, requestId: string, status: number, body: unknown, extraHeaders: Readonly<Record<string, string>> = {}): void {
-  const payload = body === null || body === undefined ? '' : JSON.stringify(body);
+function sendJson(response: ServerResponse, requestId: string, status: number, body: unknown, extraHeaders: Readonly<Record<string, string>> = {}, rawPayload?: string): void {
+  const payload = rawPayload ?? (body === null || body === undefined ? '' : JSON.stringify(body));
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': requestId,
@@ -42,12 +42,17 @@ function sendJson(response: ServerResponse, requestId: string, status: number, b
   response.end(payload);
 }
 
+let expectedAuthHeader: string | null = null;
+
 /** True when the request carries the trial token this process was given. */
 function authorized(request: IncomingMessage): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (expectedAuthHeader === null) {
+    const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+    expectedAuthHeader = expected === '' ? '' : `Bearer ${expected}`;
+  }
   const header = request.headers.authorization ?? '';
-  if (expected === '') return header.startsWith('Bearer ') && header.length > 7;
-  return header === `Bearer ${expected}`;
+  if (expectedAuthHeader === '') return header.startsWith('Bearer ') && header.length > 7;
+  return header === expectedAuthHeader;
 }
 
 export function createApp(): Server {
@@ -100,7 +105,7 @@ export function createApp(): Server {
             response.writeHead(204, { 'x-github-request-id': requestId });
             return response.end();
           }
-          return sendJson(response, requestId, result.status, result.body, result.headers);
+          return sendJson(response, requestId, result.status, result.body, result.headers, result.rawBody);
         }
 
         // Git smart HTTP — /{owner}/{repo}.git/...

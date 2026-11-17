@@ -12,6 +12,8 @@ export interface ApiResult {
   readonly status: number;
   readonly body: unknown;
   readonly headers?: Readonly<Record<string, string>>;
+  /** Pre-serialized JSON body; app.ts sends it verbatim when present. */
+  readonly rawBody?: string;
 }
 
 export interface RestRequest {
@@ -26,8 +28,15 @@ export interface RestRequest {
 
 const EPOCH_SEC = 1_700_000_000;
 
+const isoSeqCache = new Map<number, string>();
+
 function isoSeq(seq: number): string {
-  return new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  const cached = isoSeqCache.get(seq);
+  if (cached !== undefined) return cached;
+  const rendered = new Date((EPOCH_SEC + seq) * 1000).toISOString();
+  if (isoSeqCache.size > 4096) isoSeqCache.clear();
+  isoSeqCache.set(seq, rendered);
+  return rendered;
 }
 
 function json(status: number, body: unknown, headers?: Readonly<Record<string, string>>): ApiResult {
@@ -438,7 +447,12 @@ export function handleRest(store: Store, request: RestRequest): ApiResult {
         if (method === 'GET') {
           const issue = store.getIssue(repo, issueNumber);
           if (!issue) return notFound('Not Found');
-          return json(200, issueJson(repo, issue));
+          // The read hot path: an unpatched issue serializes once, then the
+          // cached bytes are served verbatim (patchIssue clears the cache).
+          if (issue.jsonCache !== undefined) return { status: 200, body: null, rawBody: issue.jsonCache };
+          const rawBody = JSON.stringify(issueJson(repo, issue));
+          issue.jsonCache = rawBody;
+          return { status: 200, body: null, rawBody };
         }
         if (method === 'PATCH') {
           const parsed = parseBody(request);
